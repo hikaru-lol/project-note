@@ -1,38 +1,39 @@
 #!/usr/bin/env python3
-"""YouTube動画の字幕を抽出するスクリプト。
+"""YouTube動画の字幕とメタ情報を抽出するスクリプト（yt-dlp版）。
 
 - urls.txt（または引数）のURLを順に処理する（1行1URL、#と空行は無視）
-- 字幕があれば transcripts/<video_id>.md に保存
+- 字幕があれば transcripts/<video_id>.md に「メタ情報＋字幕」を保存
 - 字幕がなければ skipped.md に「理由: 字幕なし」等で記録してスキップ
 - 分析（要約・キーポイント抽出など）は Claude Code on the web 側で行う
-  （このスクリプトはテキスト抽出だけを担当し、API課金は発生しない）
+  （このスクリプトは抽出だけを担当し、API課金は発生しない）
+
+ポイント:
+  YouTube はクラウドIPからの通常アクセスをボット判定で弾くが、yt-dlp の
+  player_client=android_vr を使うと cookie なしでも字幕・メタ情報を取得できる。
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    VideoUnavailable,
-    InvalidVideoId,
-    AgeRestricted,
-    VideoUnplayable,
-    IpBlocked,
-    RequestBlocked,
-)
+import yt_dlp
+from yt_dlp.utils import DownloadError
 
-# 字幕の優先言語（この順で探し、無ければ利用可能な任意の言語を使う）
+# 字幕の優先言語（この順で探し、無ければ取得できた言語を使う）
 PREFERRED_LANGS = ["ja", "en"]
+# ボット判定を回避できるプレーヤークライアント
+PLAYER_CLIENT = "android_vr"
 
 ROOT = Path(__file__).resolve().parent
 URLS_FILE = ROOT / "urls.txt"
 OUT_DIR = ROOT / "transcripts"
 SKIP_FILE = ROOT / "skipped.md"
+# 任意: ログイン済みcookie（Netscape形式）を置くと429回避に強くなる
+COOKIE_FILE = ROOT / "cookies.txt"
 
 
 def extract_video_id(line: str) -> str | None:
@@ -40,15 +41,14 @@ def extract_video_id(line: str) -> str | None:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-    # 11文字のIDだけが渡された場合
     if re.fullmatch(r"[\w-]{11}", line):
         return line
     patterns = [
-        r"(?:v=|/watch\?.*v=)([\w-]{11})",  # watch?v=ID
-        r"youtu\.be/([\w-]{11})",            # youtu.be/ID
-        r"/shorts/([\w-]{11})",              # /shorts/ID
-        r"/embed/([\w-]{11})",               # /embed/ID
-        r"/live/([\w-]{11})",                # /live/ID
+        r"(?:v=|/watch\?.*v=)([\w-]{11})",
+        r"youtu\.be/([\w-]{11})",
+        r"/shorts/([\w-]{11})",
+        r"/embed/([\w-]{11})",
+        r"/live/([\w-]{11})",
     ]
     for pat in patterns:
         m = re.search(pat, line)
@@ -65,43 +65,105 @@ def fmt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
-def fetch_transcript(api: YouTubeTranscriptApi, video_id: str):
-    """利用可能な字幕を取得。優先言語→任意言語の順で試す。
+def _ydl_opts(tmpdir: str) -> dict:
+    opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,        # 自動生成字幕も対象
+        "subtitleslangs": PREFERRED_LANGS,
+        "subtitlesformat": "json3",       # タイムスタンプ付きで扱いやすい
+        "extractor_args": {"youtube": {"player_client": [PLAYER_CLIENT]}},
+        "outtmpl": str(Path(tmpdir) / "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        # --- 429（レート制限）対策の自己スロットリング ---
+        "retries": 5,
+        "extractor_retries": 3,
+        "sleep_interval_requests": 2,     # リクエスト間に最低2秒空ける
+        "sleep_interval": 1,
+        "max_sleep_interval": 5,
+    }
+    # cookies.txt があれば使う（ログイン済みなら429に強い）
+    if COOKIE_FILE.exists():
+        opts["cookiefile"] = str(COOKIE_FILE)
+    return opts
 
-    返り値: (FetchedTranscript, language_code)
-    TranscriptsDisabled / NoTranscriptFound は「字幕なし」として扱う。
+
+def parse_json3(path: Path) -> list[tuple[float, str]]:
+    """json3字幕を (開始秒, テキスト) のリストに変換。"""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    out: list[tuple[float, str]] = []
+    for event in data.get("events", []):
+        segs = event.get("segs")
+        if not segs:
+            continue
+        text = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+        if not text:
+            continue
+        out.append((event.get("tStartMs", 0) / 1000.0, text))
+    return out
+
+
+def fetch(url: str, tmpdir: str):
+    """yt-dlpで字幕＋メタ情報を取得。
+
+    返り値: (info_dict, segments | None, lang | None)
+    segments が None なら字幕なし。
     """
-    transcript_list = api.list(video_id)  # 字幕が一切無ければ TranscriptsDisabled
-    available = [t.language_code for t in transcript_list]
-    ordered = [l for l in PREFERRED_LANGS if l in available]
-    ordered += [l for l in available if l not in ordered]
-    if not ordered:
-        raise NoTranscriptFound(video_id, PREFERRED_LANGS, transcript_list)
-    fetched = api.fetch(video_id, languages=ordered)
-    return fetched, ordered[0]
+    with yt_dlp.YoutubeDL(_ydl_opts(tmpdir)) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    requested = info.get("requested_subtitles") or {}
+    if not requested:
+        return info, None, None
+
+    lang = next((l for l in PREFERRED_LANGS if l in requested), next(iter(requested)))
+    sub = requested[lang]
+    path = sub.get("filepath")
+    if not path:
+        cands = list(Path(tmpdir).glob(f"*.{lang}.json3"))
+        path = str(cands[0]) if cands else None
+    if not path or not Path(path).exists():
+        return info, None, None
+
+    return info, parse_json3(Path(path)), lang
 
 
-def save_transcript(video_id: str, url: str, fetched, lang: str) -> Path:
-    """タイムスタンプ付き字幕と、分析用の連結全文を保存。"""
+def meta_lines(info: dict) -> list[str]:
+    """メタ情報をMarkdownの箇条書きに整形。"""
+    up = info.get("upload_date")  # YYYYMMDD
+    up_fmt = f"{up[:4]}-{up[4:6]}-{up[6:]}" if up and len(up) == 8 else (up or "不明")
+    dur = info.get("duration")
+    dur_fmt = fmt_time(dur) if isinstance(dur, (int, float)) else "不明"
+    views = info.get("view_count")
+    return [
+        f"- タイトル: {info.get('title', '不明')}",
+        f"- チャンネル: {info.get('uploader', info.get('channel', '不明'))}",
+        f"- 公開日: {up_fmt}",
+        f"- 長さ: {dur_fmt}",
+        f"- 再生数: {views:,}" if isinstance(views, int) else "- 再生数: 不明",
+        f"- URL: {info.get('webpage_url', '')}",
+    ]
+
+
+def save_transcript(video_id: str, info: dict, segments: list[tuple[float, str]], lang: str) -> Path:
+    """メタ情報＋タイムスタンプ付き字幕＋全文を保存。"""
     OUT_DIR.mkdir(exist_ok=True)
     out = OUT_DIR / f"{video_id}.md"
 
-    lines = [
-        f"# Transcript: {video_id}",
-        "",
-        f"- URL: {url}",
-        f"- 言語: {lang}",
-        f"- セグメント数: {len(fetched)}",
-        "",
-        "## 字幕（タイムスタンプ付き）",
-        "",
-    ]
+    lines = [f"# {info.get('title', video_id)}", ""]
+    lines += meta_lines(info)
+    lines += [f"- 字幕言語: {lang}", f"- セグメント数: {len(segments)}", ""]
+
+    desc = (info.get("description") or "").strip()
+    if desc:
+        lines += ["## 概要欄", "", desc, ""]
+
+    lines += ["## 字幕（タイムスタンプ付き）", ""]
     plain_parts = []
-    for snippet in fetched:
-        text = snippet.text.replace("\n", " ").strip()
-        if not text:
-            continue
-        lines.append(f"[{fmt_time(snippet.start)}] {text}")
+    for start, text in segments:
+        lines.append(f"[{fmt_time(start)}] {text}")
         plain_parts.append(text)
 
     lines += ["", "## 全文（連結）", "", " ".join(plain_parts), ""]
@@ -109,8 +171,26 @@ def save_transcript(video_id: str, url: str, fetched, lang: str) -> Path:
     return out
 
 
+def classify_error(err: Exception) -> str:
+    """yt-dlpのエラーをスキップ理由に変換。"""
+    msg = str(err)
+    low = msg.lower()
+    if "drm" in low:
+        return "DRM保護で取得不可"
+    if "private video" in low:
+        return "非公開動画"
+    if "members-only" in low or "members only" in low:
+        return "メンバー限定動画"
+    if "removed" in low or "no longer available" in low or "unavailable" in low:
+        return "動画が利用不可（削除/非公開など）"
+    if "age" in low and "confirm" in low:
+        return "年齢制限"
+    if "not a bot" in low or "sign in to confirm" in low:
+        return "YouTubeにブロックされた（ボット判定）"
+    return f"取得失敗: {type(err).__name__}"
+
+
 def read_urls() -> list[str]:
-    """引数があればそれを、無ければ urls.txt を読む。"""
     if len(sys.argv) > 1:
         return sys.argv[1:]
     if URLS_FILE.exists():
@@ -121,10 +201,8 @@ def read_urls() -> list[str]:
 
 def main() -> None:
     urls = read_urls()
-    api = YouTubeTranscriptApi()
-
     saved: list[str] = []
-    skipped: list[tuple[str, str]] = []  # (url, 理由)
+    skipped: list[tuple[str, str]] = []
 
     for raw in urls:
         raw = raw.strip()
@@ -135,28 +213,27 @@ def main() -> None:
             skipped.append((raw, "URL解析失敗（動画IDを取得できず）"))
             print(f"SKIP  {raw}  -> URL解析失敗")
             continue
+
         try:
-            fetched, lang = fetch_transcript(api, video_id)
-        except (TranscriptsDisabled, NoTranscriptFound):
-            skipped.append((raw, "字幕なし"))
-            print(f"SKIP  {video_id}  -> 字幕なし")
-            continue
-        except (VideoUnavailable, VideoUnplayable, AgeRestricted, InvalidVideoId) as e:
-            skipped.append((raw, f"動画にアクセス不可: {type(e).__name__}"))
-            print(f"SKIP  {video_id}  -> アクセス不可 ({type(e).__name__})")
-            continue
-        except (IpBlocked, RequestBlocked) as e:
-            skipped.append((raw, f"YouTube側でブロック: {type(e).__name__}"))
-            print(f"SKIP  {video_id}  -> ブロック ({type(e).__name__})")
+            with tempfile.TemporaryDirectory() as tmp:
+                info, segments, lang = fetch(raw, tmp)
+                if segments is None:
+                    skipped.append((raw, "字幕なし"))
+                    print(f"SKIP  {video_id}  -> 字幕なし")
+                    continue
+                path = save_transcript(video_id, info, segments, lang)
+        except DownloadError as e:
+            reason = classify_error(e)
+            skipped.append((raw, reason))
+            print(f"SKIP  {video_id}  -> {reason}")
             continue
         except Exception as e:  # 想定外も止めずに記録して継続
             skipped.append((raw, f"取得失敗: {type(e).__name__}: {e}"))
             print(f"SKIP  {video_id}  -> 取得失敗 ({type(e).__name__})")
             continue
 
-        path = save_transcript(video_id, raw, fetched, lang)
         saved.append(video_id)
-        print(f"OK    {video_id}  -> {path.relative_to(ROOT)} ({lang}, {len(fetched)}セグメント)")
+        print(f"OK    {video_id}  -> {path.relative_to(ROOT)} ({lang}, {len(segments)}セグメント)")
 
     if skipped:
         skip_lines = ["# スキップした動画", ""]
