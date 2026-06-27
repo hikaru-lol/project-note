@@ -1,0 +1,5 @@
+# 分析したいYouTube動画のURLを1行に1つ書いてください。
+# 「#」で始まる行と空行は無視されます。
+# 例:
+# https://www.youtube.com/watch?v=dQw4w9WgXcQ
+# https://youtu.be/dQw4w9WgXcQ
